@@ -12,8 +12,6 @@
  * @license http://www.opensource.org/licenses/mit-license.php MIT License
  */
 use \Workerman\Worker;
-use \Workerman\WebServer;
-use \Workerman\Connection\TcpConnection;
 use \Workerman\Connection\AsyncTcpConnection;
 use \Workerman\Autoloader;
 
