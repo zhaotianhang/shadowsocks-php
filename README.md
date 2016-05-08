@@ -1,21 +1,21 @@
 # shadowsocks-php
 A php port of [shadowsocks](https://github.com/shadowsocks/shadowsocks) based on [Workerman](https://github.com/walkor/Workerman)
 
-# 配置
+# Config
 Applications/Shadowsocks/config.php
 
-## 运行
+## Start
 
 php start.php start -d
 
-## 停止
+## Stop
 
 php start.php stop
 
-## 查看状态
+## Status
 
 php start.php status
 
-## 说明
-
-本应用基于workerman框架开发，workerman更多信息参见 http://www.workerman.net
+## Other links
+https://github.com/walkor/php-socks5  
+https://github.com/walkor/php-http-proxy
