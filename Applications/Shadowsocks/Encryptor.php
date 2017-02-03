@@ -40,8 +40,8 @@ class Encryptor
         'des-cfb'=> array(8, 8),
         'idea-cfb'=>array(16, 8),
         'rc2-cfb'=> array(16, 8),
-        'rc4'=> array(16, 0),
-        'rc4-md5'=> array(16, 16),
+        //'rc4'=> array(16, 0),      //rc4的iv长度为0，会有问题，暂时去掉
+        //'rc4-md5'=> array(16, 16), //php的openssl找不到rc4-md5这个算法，暂时去掉
         'seed-cfb'=> array(16, 16)
     );
     
