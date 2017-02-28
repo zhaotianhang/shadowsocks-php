@@ -84,6 +84,9 @@ $worker->onMessage = function($connection, $buffer)
             $host = $header_data[1];
             $port = $header_data[2];
             $address = "tcp://$host:$port";
+            if (empty($host) || empty($port)) {
+                return $connection->close();
+            }
             // 异步建立与实际服务器的远程连接
             $remote_connection = new AsyncTcpConnection($address);
             $connection->opposite = $remote_connection;
