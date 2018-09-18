@@ -1,5 +1,5 @@
 # shadowsocks-php
-A php port of [shadowsocks](https://github.com/shadowsocks/shadowsocks) based on [Workerman](https://github.com/walkor/Workerman)， UDP supported
+A php port of [shadowsocks](https://github.com/shadowsocks/shadowsocks) based on [Workerman](https://github.com/walkor/Workerman)， UDP supported, compatible with OutLine
 
 # Config
 Applications/Shadowsocks/config.php
