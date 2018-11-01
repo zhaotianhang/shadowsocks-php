@@ -12,7 +12,9 @@
  * @license http://www.opensource.org/licenses/mit-license.php MIT License
  */
 use \Workerman\Worker;
+use \Workerman\Connection\UdpConnection;
 use \Workerman\Connection\AsyncTcpConnection;
+use \Workerman\Connection\AsyncUdpConnection;
 use \Workerman\Autoloader;
 
 // 自动加载类
@@ -54,6 +56,7 @@ if($METHOD == 'table')
 {
     Encryptor::initTable($PASSWORD);
 }
+
 // 当shadowsocks客户端连上来时
 $worker->onConnect = function($connection)use($METHOD, $PASSWORD)
 {
@@ -62,15 +65,22 @@ $worker->onConnect = function($connection)use($METHOD, $PASSWORD)
     // 初始化加密类
     $connection->encryptor = new Encryptor($PASSWORD, $METHOD);
 };
+
 // UDP support
-$worker2->onMessage=function($connection, $buffer)use($METHOD, $PASSWORD)
+$worker2->onMessage = function($connection, $buffer)use($METHOD, $PASSWORD)
 {
 	if (is_null(@$connection->encryptor)){
 		$connection->encryptor = new Encryptor($PASSWORD, $METHOD);
 	}
 	$buffer = $connection->encryptor->decrypt($buffer);
 	// 解析socket5头
-	$header_data = parse_socket5_header2($buffer);
+	$header_data = parse_socket5_header($buffer);
+    // 解析头部出错，则关闭连接
+    if(!$header_data)
+    {
+        $connection->close();
+        return;
+    }
 	// 头部长度
 	$header_len = $header_data[3];
 	$host = $header_data[1];
@@ -79,18 +89,19 @@ $worker2->onMessage=function($connection, $buffer)use($METHOD, $PASSWORD)
 	//echo $address."\n";
 	
 	$remote_connection = new AsyncUdpConnection($address);
-	@$remote_connection->source=$connection;
-	$remote_connection->onConnect=function ($remote_connection)use ($buffer,$header_len){
+	@$remote_connection->source = $connection;
+	$remote_connection->onConnect = function ($remote_connection)use ($buffer, $header_len){
 		$remote_connection->send(substr($buffer,$header_len));
 	};
-	$remote_connection->onMessage=function ($remote_connection,$buffer)use($header_data){
-		$_header = pack_header($header_data[1],$header_data[0],$header_data[2]);
-		$_data = $remote_connection->source->encryptor->encrypt($_header.$buffer);
+	$remote_connection->onMessage = function ($remote_connection, $buffer)use($header_data){
+		$_header = pack_header($header_data[1], $header_data[0], $header_data[2]);
+		$_data = $remote_connection->source->encryptor->encrypt($_header . $buffer);
 		$remote_connection->source->send($_data);
 	};
 	$remote_connection->connect();
 	
 };
+
 // 当shadowsocks客户端发来消息时
 $worker->onMessage = function($connection, $buffer)
 {
@@ -104,14 +115,14 @@ $worker->onMessage = function($connection, $buffer)
             $buffer = $connection->encryptor->decrypt($buffer);
             // 解析socket5头
             $header_data = parse_socket5_header($buffer);
-            // 头部长度
-            $header_len = $header_data[3];
             // 解析头部出错，则关闭连接
             if(!$header_data)
             {
                 $connection->close();
                 return;
             }
+            // 头部长度
+            $header_len = $header_data[3];
             // 解析得到实际请求地址及端口
             $host = $header_data[1];
             $port = $header_data[2];
@@ -206,31 +217,68 @@ $worker->onMessage = function($connection, $buffer)
  */
 function parse_socket5_header($buffer)
 {
+    /*
+     * Shadowsocks TCP Relay Header:
+     *
+     *    +------+----------+----------+
+     *    | ATYP | DST.ADDR | DST.PORT |
+     *    +------+----------+----------+
+     *    |  1   | Variable |    2     |
+     *    +------+----------+----------+
+     *
+     */
+    //检查长度
+    if( strlen($buffer) < 1 ) {
+        echo "invalid length for header\n";
+        return false;
+    }
     $addr_type = ord($buffer[0]);
     switch($addr_type)
     {
         case ADDRTYPE_IPV4:
+            $header_length = 7;
+            if(strlen($buffer) < $header_length) {
+                echo "invalid length for ipv4 address\n";
+                return false;
+            }
             $dest_addr = ord($buffer[1]).'.'.ord($buffer[2]).'.'.ord($buffer[3]).'.'.ord($buffer[4]);
             $port_data = unpack('n', substr($buffer, 5, 2));
             $dest_port = $port_data[1];
-            $header_length = 7;
             break;
         case ADDRTYPE_HOST:
+            if( strlen($buffer) < 2 ) {
+                echo "invalid length host name length\n";
+                return false;
+            }
             $addrlen = ord($buffer[1]);
+            $header_length = $addrlen + 4;
+            if(strlen($buffer) < $header_length) {
+                echo "invalid host name length\n";
+                return false;
+            }
             $dest_addr = substr($buffer, 2, $addrlen);
             $port_data = unpack('n', substr($buffer, 2 + $addrlen, 2));
             $dest_port = $port_data[1];
-            $header_length = $addrlen + 4;
             break;
-       case ADDRTYPE_IPV6:
-            echo "todo ipv6 not support yet\n";
-            return false;
-       default:
+        case ADDRTYPE_IPV6:
+            // todo ...
+            // ipv6 not support yet ...
+            $header_length = 19;
+            if(strlen($buffer) < $header_length) {
+                echo "invalid length for ipv6 address\n";
+                return false;
+            }
+            $dest_addr = inet_ntop(substr($buffer, 1, 16));
+            $port_data = unpack('n', substr($buffer, 17, 2));
+            $dest_port = $port_data[1];
+            break;
+        default:
             echo "unsupported addrtype $addr_type\n";
             return false;
     }
     return array($addr_type, $dest_addr, $dest_port, $header_length);
 }
+
 /*
  UDP 部分 返回客户端 头部数据 by @Zac
  //生成UDP header 它这里给返回解析出来的域名貌似给udp dns域名解析用的
