@@ -48,7 +48,6 @@ class Encryptor
         //'rc4'=> array(16, 0),      //rc4的iv长度为0，会有问题，暂时去掉
         //'rc4-md5'=> array(16, 16), //php的openssl找不到rc4-md5这个算法，暂时去掉
         'seed-cfb'=> array(16, 16),
-        'chacha20-ietf'=> array(32, 12),
         'aes-256-gcm'=> array(32, 32),  //对于AEAD，第二个参数是salt长度
         'chacha20-ietf-poly1305'=> array(32, 32),
         'xchacha20-ietf-poly1305'=> array(32, 32),
@@ -368,7 +367,7 @@ class AEADDecipher extends AEADEncipher
             }
             $result .= $temp;
         }
-        $this->_aead_tail = $data;
+        $this->_aead_tail .= $data;
         return $result;
     }
 

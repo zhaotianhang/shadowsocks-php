@@ -44,54 +44,6 @@ define('ADDRTYPE_HOST', 3);
 // 初始化worker，监听$PORT端口
 $worker = new Worker('tcp://0.0.0.0:'.$PORT);
 
-$worker2 = new Worker('udp://0.0.0.0:'.$PORT);
-
-// 进程数量
-$worker2->count=$worker->count = $PROCESS_COUNT;
-// 名称
-$worker2->name=$worker->name = 'shadowsocks-server';
-
-// 如果加密算法为table，初始化table
-if($METHOD == 'table')
-{
-    Encryptor::initTable($PASSWORD);
-}
-
-// UDP support
-$worker2->onMessage = function($connection, $buffer)use($METHOD, $PASSWORD)
-{
-    if (is_null(@$connection->encryptor)){
-        $connection->encryptor = new Encryptor($PASSWORD, $METHOD);
-    }
-    $buffer = $connection->encryptor->decrypt($buffer);
-    // 解析socket5头
-    $header_data = parse_socket5_header($buffer);
-    // 解析头部出错，则关闭连接
-    if(!$header_data)
-    {
-        $connection->close();
-        return;
-    }
-    // 头部长度
-    $header_len = $header_data[3];
-    $host = $header_data[1];
-    $port = $header_data[2];
-    $address = "udp://$host:$port";
-    //echo $address."\n";
-
-    $remote_connection = new AsyncUdpConnection($address);
-    @$remote_connection->source = $connection;
-    $remote_connection->onConnect = function ($remote_connection)use ($buffer, $header_len){
-        $remote_connection->send(substr($buffer,$header_len));
-    };
-    $remote_connection->onMessage = function ($remote_connection, $buffer)use($header_data){
-        $_header = pack_header($header_data[1], $header_data[0], $header_data[2]);
-        $_data = $remote_connection->source->encryptor->encrypt($_header . $buffer);
-        $remote_connection->source->send($_data);
-    };
-    $remote_connection->connect();
-};
-
 // 当shadowsocks客户端连上来时
 $worker->onConnect = function($connection)use($METHOD, $PASSWORD)
 {
@@ -208,6 +160,50 @@ $worker->onMessage = function($connection, $buffer)
                 $remote_connection->send(substr($buffer,$header_len));
             }
     }
+};
+
+// UDP support
+$worker_udp = new Worker('udp://0.0.0.0:'.$PORT);
+
+// 进程数量
+$worker_udp->count=$worker->count = $PROCESS_COUNT;
+// 名称
+$worker_udp->name=$worker->name = 'shadowsocks-server';
+
+$worker_udp->onMessage = function($connection, $buffer)use($METHOD, $PASSWORD)
+{
+    if (is_null(@$connection->encryptor)){
+        $connection->encryptor = new Encryptor($PASSWORD, $METHOD);
+    }
+    $buffer = $connection->encryptor->decrypt($buffer);
+    // 解析socket5头
+    $header_data = parse_socket5_header($buffer);
+    // 解析头部出错，则关闭连接
+    if(!$header_data)
+    {
+        $connection->close();
+        return;
+    }
+    // 头部长度
+    $header_len = $header_data[3];
+    $host = $header_data[1];
+    $port = $header_data[2];
+    $address = "udp://$host:$port";
+    echo $address."\n";
+
+    $remote_connection = new AsyncUdpConnection($address);
+    @$remote_connection->source = $connection;
+    $remote_connection->onConnect = function ($remote_connection)use ($buffer, $header_len)
+    {
+        $remote_connection->send(substr($buffer,$header_len));
+    };
+    $remote_connection->onMessage = function ($remote_connection, $buffer)use($header_data)
+    {
+        $_header = pack_header($header_data[1], $header_data[0], $header_data[2]);
+        $_data = $remote_connection->source->encryptor->encrypt($_header . $buffer);
+        $remote_connection->source->send($_data);
+    };
+    $remote_connection->connect();
 };
 
 /**
