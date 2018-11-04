@@ -49,6 +49,7 @@ class Encryptor
         //'rc4-md5'=> array(16, 16), //php的openssl找不到rc4-md5这个算法，暂时去掉
         'seed-cfb'=> array(16, 16),
         'aes-256-gcm'=> array(32, 32),  //对于AEAD，第二个参数是salt长度
+        'chacha20-poly1305'=> array(32, 32),
         'chacha20-ietf-poly1305'=> array(32, 32),
         'xchacha20-ietf-poly1305'=> array(32, 32),
     );
@@ -194,6 +195,9 @@ class Encryptor
         if($method == 'aes-256-gcm') {
             return true;
         }
+        if($method == 'chacha20-poly1305') {
+            return true;
+        }        
         if($method == 'chacha20-ietf-poly1305') {
             return true;
         }
@@ -268,8 +272,10 @@ class AEADEncipher
     protected $_aead_tail;
     protected $_aead_subkey;
     protected $_aead_iv;
+    protected $_aead_chunk_id;
     protected static $_methodSupported = array(
         'aes-256-gcm'=> array(32, 12),
+        'chacha20-poly1305'=> array(32, 8),
         'chacha20-ietf-poly1305'=> array(32, 12),
         'xchacha20-ietf-poly1305'=> array(32, 24),
     );
@@ -282,6 +288,7 @@ class AEADEncipher
         $this->_aead_iv = str_repeat("\x00", $iv_len);
         /* subkey生成 */
         $this->_aead_subkey = hash_hkdf("sha1", $key, strlen($key), "ss-subkey", $salt);
+        $this->_aead_chunk_id = 0;
     }
 
     public function update($data)
@@ -314,10 +321,9 @@ class AEADEncipher
          */
         $plen = strlen($buffer);
         if($plen > CHUNK_SIZE_MASK) {
-            $plen = CHUNK_SIZE_MASK - 2;
+            $plen = CHUNK_SIZE_MASK;
         }
         $data = substr($buffer, 0, $plen);
-        //echo "plen_e = " . $plen . "\n";
         $plen_bin = pack('n', $plen);
         $result .= $this->aead_encrypt($plen_bin, '', $iv, $subkey);
         if(strlen($result) !=  AEAD_TAG_LEN + CHUNK_SIZE_LEN) {
@@ -329,6 +335,7 @@ class AEADEncipher
             return CRYPTO_ERROR;
         }
         sodium_increment($iv);
+        $this->_aead_chunk_id++;
         $buffer = substr($buffer, $plen);
         return CRYPTO_OK;
     }
@@ -337,6 +344,8 @@ class AEADEncipher
     {
         if($this->_algorithm == 'aes-256-gcm')
             return sodium_crypto_aead_aes256gcm_encrypt($msg, $ad, $nonce, $key);
+        else if($this->_algorithm == 'chacha20-poly1305')
+            return sodium_crypto_aead_chacha20poly1305_encrypt($msg, $ad, $nonce, $key);
         else if($this->_algorithm == 'chacha20-ietf-poly1305')
             return sodium_crypto_aead_chacha20poly1305_ietf_encrypt($msg, $ad, $nonce, $key);
         else if($this->_algorithm == 'xchacha20-ietf-poly1305')
@@ -348,26 +357,30 @@ class AEADDecipher extends AEADEncipher
 {
     public function update($data)
     {
-        $data = $this->_aead_tail . $data;
+        $tl = strlen($this->_aead_tail);
+        if($tl) {
+            $data = $this->_aead_tail . $data;
+            $this->_aead_tail = '';
+        }
+
         $result = '';
         while(strlen($data) > 0) {
-            $temp = '';
-            $err = $this->aead_chunk_decrypt($this->_aead_iv, $this->_aead_subkey, $data, $temp);
+            $err = $this->aead_chunk_decrypt($this->_aead_iv, $this->_aead_subkey, $data, $result);
             if($err == CRYPTO_ERROR) {
-                echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD decrypt error\n";
+                echo "[ " . __LINE__ . "]" . "AEAD decrypt error\n";
                 return '';
             } else if($err == CRYPTO_NEED_MORE) {
                 if( strlen($data) == 0 ) {
-                    echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD decrypt error\n";
+                    echo "[ " . __LINE__ . "]" . "AEAD decrypt error\n";
                     return '';
                 } else {
-                    echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD decrypt tail\n";
+                    $this->_aead_tail .= $data;
+                    //echo "[ " . __LINE__ . "]" . "AEAD decrypt tail\n";
                     break;
                 }
             }
-            $result .= $temp;
         }
-        $this->_aead_tail .= $data;
+        
         return $result;
     }
 
@@ -383,27 +396,33 @@ class AEADDecipher extends AEADEncipher
          *  +--------------------------+------------+-------------------+-------------+
          *
          */
+        //验证chunk长度
         if(strlen($buffer) <= 2 * AEAD_TAG_LEN + CHUNK_SIZE_LEN) {
             return CRYPTO_NEED_MORE;
         }
 
         $payload_length_enc_length = AEAD_TAG_LEN + CHUNK_SIZE_LEN;
         $payload_length_enc = substr($buffer, 0, $payload_length_enc_length);
-        $buffer = substr($buffer, $payload_length_enc_length);
 
         $mlen = $this->aead_decrypt($payload_length_enc, '', $iv, $subkey);
-        if(strlen($mlen) == 0) {
-            echo "[" .__FILE__ . " " . __LINE__ . "]" . "mlen error!\n";
+        if(strlen($mlen) != CHUNK_SIZE_LEN) {
+            echo "[ " . __LINE__ . "]" . "mlen error! id: " . $this->_aead_chunk_id . "\n";
             return CRYPTO_ERROR;
         }
         $payload_length = unpack('n', $mlen);
-        $payload_length = $payload_length[1];
+        $payload_length = intval($payload_length[1]) & CHUNK_SIZE_MASK;
         $payload_enc_length = $payload_length + AEAD_TAG_LEN;
+        //验证payload长度
+        if(strlen($buffer) - $payload_length_enc_length < $payload_enc_length) {
+            return CRYPTO_NEED_MORE;
+        }
+        $buffer = substr($buffer, $payload_length_enc_length);
         $payload_enc = substr($buffer, 0, $payload_enc_length);
         $buffer = substr($buffer, $payload_enc_length);
         sodium_increment($iv);
-        $result = $this->aead_decrypt($payload_enc, '', $iv, $subkey);
+        $result .= $this->aead_decrypt($payload_enc, '', $iv, $subkey);
         sodium_increment($iv);
+        $this->_aead_chunk_id++;
         return CRYPTO_OK;
     }
 
@@ -411,6 +430,8 @@ class AEADDecipher extends AEADEncipher
     {
         if($this->_algorithm == 'aes-256-gcm')
             return sodium_crypto_aead_aes256gcm_decrypt($msg, $ad, $nonce, $key);
+        else if($this->_algorithm == 'chacha20-poly1305')
+            return sodium_crypto_aead_chacha20poly1305_decrypt($msg, $ad, $nonce, $key);
         else if($this->_algorithm == 'chacha20-ietf-poly1305')
             return sodium_crypto_aead_chacha20poly1305_ietf_decrypt($msg, $ad, $nonce, $key);
         else if($this->_algorithm == 'xchacha20-ietf-poly1305')
