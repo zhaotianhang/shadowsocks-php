@@ -32,7 +32,8 @@ class Encryptor
     protected $_decipher;
     protected $_bytesToKeyResults = array();
     protected $_cipherIv;
-    protected $_ivSent = false;
+    protected $_ivSent;
+    protected $_onceMode;
     protected static $_methodSupported = array(
         'aes-128-cfb'=> array(16, 16),
         'aes-192-cfb'=> array(24, 16),
@@ -54,10 +55,12 @@ class Encryptor
         'xchacha20-ietf-poly1305'=> array(32, 32),
     );
     
-    public function __construct($key, $method)
+    public function __construct($key, $method, $onceMode = false)
     {
         $this->_key = $key;
         $this->_method = $method;
+        $this->_ivSent = false;
+        $this->_onceMode = $onceMode;
         if($this->checkAEADMethod($this->_method)) {
             //AEAD
             $salt_len = $this->getCipherLen($this->_method);
@@ -89,9 +92,9 @@ class Encryptor
             if($this->checkAEADMethod($method)) {
                 $salt = $iv;
                 if($op === 1) {
-                    return new AEADEncipher($method, $key, $salt);
+                    return new AEADEncipher($method, $key, $salt, $this->_onceMode);
                 } else {
-                    return new AEADDecipher($method, $key, $salt);
+                    return new AEADDecipher($method, $key, $salt, $this->_onceMode);
                 }
             } else if ($method === 'rc4-md5') {
                 return $this->createRc4Md5Cipher($key, $iv, $op);
@@ -273,6 +276,7 @@ class AEADEncipher
     protected $_aead_subkey;
     protected $_aead_iv;
     protected $_aead_chunk_id;
+    protected $_aead_encipher_all;
     protected static $_methodSupported = array(
         'aes-256-gcm'=> array(32, 12),
         'chacha20-poly1305'=> array(32, 8),
@@ -280,7 +284,7 @@ class AEADEncipher
         'xchacha20-ietf-poly1305'=> array(32, 24),
     );
 
-    public function __construct($algorithm, $key, $salt)
+    public function __construct($algorithm, $key, $salt, $all = false)
     {
         $this->_algorithm = $algorithm;
         $this->_aead_tail = '';
@@ -289,10 +293,21 @@ class AEADEncipher
         /* subkey生成 */
         $this->_aead_subkey = hash_hkdf("sha1", $key, strlen($key), "ss-subkey", $salt);
         $this->_aead_chunk_id = 0;
+        $this->_aead_encipher_all = $all;
     }
 
     public function update($data)
     {
+        //UDP
+        if($this->_aead_encipher_all) {
+            $err = $this->aead_encrypt_all($this->_aead_iv, $this->_aead_subkey, $data);
+            if($err == CRYPTO_ERROR) {
+                echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD encrypt error\n";
+                return '';
+            }
+            return $data;
+        }
+        //TCP
         $result = '';
         while(strlen($data) > 0) {
             $temp = '';
@@ -305,6 +320,22 @@ class AEADEncipher
         }
         
         return $result;
+    }
+
+    protected function aead_encrypt_all(&$iv, $subkey, &$buffer)
+    {
+        /*
+         * Shadowsocks AEAD chunk:
+         *
+         *  +-------------------+-------------+
+         *  | encrypted payload | payload tag |
+         *  +-------------------+-------------+
+         *  |        n          |     16      |
+         *  +-------------------+-------------+
+         *
+         */
+        $buffer = $this->aead_encrypt($buffer, '', $iv, $subkey);
+        return CRYPTO_OK;
     }
 
     protected function aead_chunk_encrypt(&$iv, $subkey, &$buffer, &$result)
@@ -357,6 +388,16 @@ class AEADDecipher extends AEADEncipher
 {
     public function update($data)
     {
+        //UDP
+        if($this->_aead_encipher_all) {
+            $err = $this->aead_decrypt_all($this->_aead_iv, $this->_aead_subkey, $data);
+            if($err == CRYPTO_ERROR) {
+                echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD decrypt error\n";
+                return '';
+            }
+            return $data;
+        }
+        //TCP
         $tl = strlen($this->_aead_tail);
         if($tl) {
             $data = $this->_aead_tail . $data;
@@ -382,6 +423,27 @@ class AEADDecipher extends AEADEncipher
         }
         
         return $result;
+    }
+
+    public function aead_decrypt_all(&$iv, $subkey, &$buffer)
+    {
+        /*
+         * Shadowsocks AEAD chunk:
+         *
+         *  +-------------------+-------------+
+         *  | encrypted payload | payload tag |
+         *  +-------------------+-------------+
+         *  |        n          |     16      |
+         *  +-------------------+-------------+
+         *
+         */
+        //验证chunk长度
+        if(strlen($buffer) <= AEAD_TAG_LEN) {
+            return CRYPTO_ERROR;
+        }
+
+        $buffer = $this->aead_decrypt($buffer, '', $iv, $subkey);
+        return CRYPTO_OK;
     }
 
     protected function aead_chunk_decrypt(&$iv, $subkey, &$buffer, &$result)

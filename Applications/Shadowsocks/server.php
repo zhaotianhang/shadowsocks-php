@@ -173,7 +173,7 @@ $worker_udp->name=$worker->name = 'shadowsocks-server';
 $worker_udp->onMessage = function($connection, $buffer)use($METHOD, $PASSWORD)
 {
     if (is_null(@$connection->encryptor)){
-        $connection->encryptor = new Encryptor($PASSWORD, $METHOD);
+        $connection->encryptor = new Encryptor($PASSWORD, $METHOD, true);
     }
     $buffer = $connection->encryptor->decrypt($buffer);
     // 解析socket5头
@@ -189,7 +189,6 @@ $worker_udp->onMessage = function($connection, $buffer)use($METHOD, $PASSWORD)
     $host = $header_data[1];
     $port = $header_data[2];
     $address = "udp://$host:$port";
-    echo $address."\n";
 
     $remote_connection = new AsyncUdpConnection($address);
     @$remote_connection->source = $connection;
