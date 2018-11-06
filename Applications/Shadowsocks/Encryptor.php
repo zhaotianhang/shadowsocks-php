@@ -49,10 +49,12 @@ class Encryptor
         //'rc4'=> array(16, 0),      //rc4的iv长度为0，会有问题，暂时去掉
         //'rc4-md5'=> array(16, 16), //php的openssl找不到rc4-md5这个算法，暂时去掉
         'seed-cfb'=> array(16, 16),
-        'aes-256-gcm'=> array(32, 32),  //对于AEAD，第二个参数是salt长度
-        'chacha20-poly1305'=> array(32, 32),
-        'chacha20-ietf-poly1305'=> array(32, 32),
-        'xchacha20-ietf-poly1305'=> array(32, 32),
+        'aes-128-gcm'=> array(16, 16),  //(PHP >= 7.1.0) OpenSSL 对于AEAD，第二个参数是salt长度
+        'aes-192-gcm'=> array(24, 24),  //(PHP >= 7.1.0) OpenSSL
+        'aes-256-gcm'=> array(32, 32),  //(PHP >= 7.2.0) Sodium
+        'chacha20-poly1305'=> array(32, 32),  //(PHP >= 7.2.0) Sodium
+        'chacha20-ietf-poly1305'=> array(32, 32),  //(PHP >= 7.2.0) Sodium
+        'xchacha20-ietf-poly1305'=> array(32, 32),  //(PHP >= 7.2.0) Sodium
     );
     
     public function __construct($key, $method, $onceMode = false)
@@ -68,8 +70,8 @@ class Encryptor
             $salt = openssl_random_pseudo_bytes($salt_len);
             $this->_cipher = $this->getcipher($this->_key, $this->_method, 1, $salt);
         } else {
-            $iv_size = openssl_cipher_iv_length($this->_method); 
-            $iv = openssl_random_pseudo_bytes($iv_size); 
+            $iv_size = openssl_cipher_iv_length($this->_method);
+            $iv = openssl_random_pseudo_bytes($iv_size);
             $this->_cipher = $this->getcipher($this->_key, $this->_method, 1, $iv);
         }
     }
@@ -195,6 +197,12 @@ class Encryptor
 
     protected function checkAEADMethod($method)
     {
+        if($method == 'aes-128-gcm') {
+            return true;
+        }
+        if($method == 'aes-192-gcm') {
+            return true;
+        }       
         if($method == 'aes-256-gcm') {
             return true;
         }
@@ -278,6 +286,8 @@ class AEADEncipher
     protected $_aead_chunk_id;
     protected $_aead_encipher_all;
     protected static $_methodSupported = array(
+        'aes-128-gcm'=> array(16, 12),
+        'aes-192-gcm'=> array(24, 12),
         'aes-256-gcm'=> array(32, 12),
         'chacha20-poly1305'=> array(32, 8),
         'chacha20-ietf-poly1305'=> array(32, 12),
@@ -373,14 +383,23 @@ class AEADEncipher
 
     protected function aead_encrypt($msg, $ad, $nonce, $key)
     {
-        if($this->_algorithm == 'aes-256-gcm')
-            return sodium_crypto_aead_aes256gcm_encrypt($msg, $ad, $nonce, $key);
-        else if($this->_algorithm == 'chacha20-poly1305')
-            return sodium_crypto_aead_chacha20poly1305_encrypt($msg, $ad, $nonce, $key);
-        else if($this->_algorithm == 'chacha20-ietf-poly1305')
-            return sodium_crypto_aead_chacha20poly1305_ietf_encrypt($msg, $ad, $nonce, $key);
-        else if($this->_algorithm == 'xchacha20-ietf-poly1305')
-            return sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($msg, $ad, $nonce, $key);
+        switch($this->_algorithm) {
+            case 'aes-128-gcm':
+            case 'aes-192-gcm':
+                $tag = '';
+                $data = openssl_encrypt($msg, $this->_algorithm, $key, OPENSSL_RAW_DATA, $nonce, $tag, $ad);
+                return $data . $tag;
+            case 'aes-256-gcm':
+                return sodium_crypto_aead_aes256gcm_encrypt($msg, $ad, $nonce, $key);
+            case 'chacha20-poly1305':
+                return sodium_crypto_aead_chacha20poly1305_encrypt($msg, $ad, $nonce, $key);
+            case 'chacha20-ietf-poly1305':
+                return sodium_crypto_aead_chacha20poly1305_ietf_encrypt($msg, $ad, $nonce, $key);
+            case 'xchacha20-ietf-poly1305':
+                return sodium_crypto_aead_xchacha20poly1305_ietf_encrypt($msg, $ad, $nonce, $key);
+            default:
+                return '';
+        }
     }
 }
 
@@ -490,13 +509,23 @@ class AEADDecipher extends AEADEncipher
 
     protected function aead_decrypt($msg, $ad, $nonce, $key)
     {
-        if($this->_algorithm == 'aes-256-gcm')
-            return sodium_crypto_aead_aes256gcm_decrypt($msg, $ad, $nonce, $key);
-        else if($this->_algorithm == 'chacha20-poly1305')
-            return sodium_crypto_aead_chacha20poly1305_decrypt($msg, $ad, $nonce, $key);
-        else if($this->_algorithm == 'chacha20-ietf-poly1305')
-            return sodium_crypto_aead_chacha20poly1305_ietf_decrypt($msg, $ad, $nonce, $key);
-        else if($this->_algorithm == 'xchacha20-ietf-poly1305')
-            return sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($msg, $ad, $nonce, $key);
+        switch($this->_algorithm) {
+            case 'aes-128-gcm':
+            case 'aes-192-gcm':
+                $data_len = strlen($msg)-AEAD_TAG_LEN;
+                $data = substr($msg, 0, $data_len);
+                $tag = substr($msg, $data_len);
+                return openssl_decrypt($data, $this->_algorithm, $key, OPENSSL_RAW_DATA, $nonce, $tag, $ad);
+            case 'aes-256-gcm':
+                return sodium_crypto_aead_aes256gcm_decrypt($msg, $ad, $nonce, $key);
+            case 'chacha20-poly1305':
+                return sodium_crypto_aead_chacha20poly1305_decrypt($msg, $ad, $nonce, $key);
+            case 'chacha20-ietf-poly1305':
+                return sodium_crypto_aead_chacha20poly1305_ietf_decrypt($msg, $ad, $nonce, $key);
+            case 'xchacha20-ietf-poly1305':
+                return sodium_crypto_aead_xchacha20poly1305_ietf_decrypt($msg, $ad, $nonce, $key);
+            default:
+                return '';
+        }
     }
 }
