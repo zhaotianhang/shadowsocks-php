@@ -11,14 +11,6 @@
  * @link http://www.workerman.net/
  * @license http://www.opensource.org/licenses/mit-license.php MIT License
  */
-define('CHUNK_SIZE_LEN',   2);
-define('AEAD_TAG_LEN',    16);
-
-define('CRYPTO_ERROR',    -1);
-define('CRYPTO_NEED_MORE', 0);
-define('CRYPTO_OK',        1);
-
-define('CHUNK_SIZE_MASK', 0x3FFF);
 
 /**
  * 加密解密类
@@ -35,6 +27,9 @@ class Encryptor
     protected $_ivSent;
     protected $_onceMode;
     protected static $_methodSupported = array(
+        'aes-128-ctr'=> array(16, 16), //gmp, OpenSSL
+        'aes-192-ctr'=> array(24, 16), //gmp, OpenSSL
+        'aes-256-ctr'=> array(32, 16), //gmp, OpenSSL
         'aes-128-cfb'=> array(16, 16),
         'aes-192-cfb'=> array(24, 16),
         'aes-256-cfb'=> array(32, 16),
@@ -208,86 +203,129 @@ class Encipher
 {
     const BLOCK_SIZE = 64;
     protected $_algorithm;
+    protected $_algorithm_openssl;
     protected $_key;
     protected $_iv;
     protected $_tail;
-    protected $_ivLength;
-    protected $_counter;
-    protected $_ischacha20;
+    protected $_block_size;
 
     public function __construct($algorithm, $key, $iv)
     {
         $this->_algorithm = $algorithm;
         $this->_key = $key;
         $this->_iv = $iv;
-        $this->_counter = 0;
-        if($this->checkChacha20($algorithm)) {
-            $this->_ischacha20 = true;
+        if(strpos($algorithm, "chacha20") !== false || strpos($algorithm, "ctr") !== false) {
+            $this->_nonce = $iv;
+            if(function_exists('gmp_init')) {
+                $this->_counter = gmp_init('0');
+                $this->_gmp_support = true;
+            } else {
+                $this->_counter = 0;
+                $this->_gmp_support = false;
+            }
+        }
+        if(strpos($algorithm, "chacha20") !== false) {
+            $this->_block_size = static::BLOCK_SIZE;
+            $this->_algorithm_openssl = 'chacha20';
         } else {
-            $this->_ischacha20 = false;
-            $this->_ivLength = openssl_cipher_iv_length($this->_algorithm);
+            $this->_block_size = openssl_cipher_iv_length($this->_algorithm);
+            $this->_algorithm_openssl = $this->_algorithm;
         }
     }
 
     public function update($data)
     {
-        if($this->_ischacha20) {
-            return $this->chacha20_update($data);
-        }
         if (strlen($data) == 0)
             return '';
         $tl = strlen($this->_tail);
         if ($tl)
             $data = $this->_tail . $data;
-        $b = openssl_encrypt($data, $this->_algorithm, $this->_key, OPENSSL_RAW_DATA, $this->_iv);
+        if(isset($this->_counter)) {
+            if($this->_gmp_support)
+                $iv = $this->counter_mode_gen_iv_by_gmp();
+            else
+                $iv = $this->counter_mode_gen_iv();
+        } else {
+            $iv = $this->_iv;
+        }
+        $b = openssl_encrypt($data, $this->_algorithm_openssl, $this->_key, OPENSSL_RAW_DATA, $iv);
         $result = substr($b, $tl);
         $dataLength = strlen($data);
-        $mod = $dataLength%$this->_ivLength;
-        if ($dataLength >= $this->_ivLength) {
-            $iPos = -($mod + $this->_ivLength);
-            $this->_iv = substr($b, $iPos, $this->_ivLength);
+        $mod = $dataLength % $this->_block_size;
+        if ($dataLength >= $this->_block_size) {
+            $iPos = -($mod + $this->_block_size);
+            $this->_iv = substr($b, $iPos, $this->_block_size);
         }
         $this->_tail = $mod!=0 ? substr($data, -$mod):'';
+        if(isset($this->_counter)) {
+            if($this->_gmp_support)
+                $this->_counter =  gmp_add($this->_counter, strval(strlen($result)) );
+            else
+                $this->_counter += strlen($result);
+        }
         return $result;
     }
 
-    protected function checkChacha20($method)
+    protected function counter_mode_gen_iv_by_gmp()
     {
-        return (strpos($method, "chacha20") !== false);
-    }
-
-    //128位的iv，其中32位用于counter，建议使用chacha20-ietf
-    //more: https://libsodium.gitbook.io/doc/advanced/stream_ciphers/chacha20
-    protected function fixIVForOpenssl($iv)
-    {
-        if($this->_algorithm == 'chacha20-ietf') {
-            /* The IETF variant increases the nonce size to 96 bits,
-             * but reduces the counter size down to 32 bits, allowing 
-             * only up to 256 GB of data to be safely encrypted with a 
-             * given (key, nonce) pair.
-             */
-            $counter_pack = pack("V", $this->_counter/static::BLOCK_SIZE);
-            return $counter_pack . $iv;
-        } else if($this->_algorithm == 'chacha20') {
-            /* The original ChaCha20 cipher with a 64-bit nonce and a 64-bit counter,
-             * allowing a practically unlimited amount of data to be encrypted with the same
-             * (key, nonce) pair 
-             */
-            $counter_pack = pack("P", $this->_counter/static::BLOCK_SIZE);
-            return $counter_pack . $iv;
+        $counter = gmp_div_q($this->_counter, strval($this->_block_size));
+        switch($this->_algorithm) {
+            case 'chacha20-ietf':
+                //more: https://libsodium.gitbook.io/doc/advanced/stream_ciphers/chacha20
+                /* The IETF variant increases the nonce size to 96 bits,
+                 * but reduces the counter size down to 32 bits, allowing 
+                 * only up to 256 GB of data to be safely encrypted with a 
+                 * given (key, nonce) pair.
+                 */
+                $counter_pack = gmp_export($counter, 4, GMP_LSW_FIRST);
+                $counter_pack = str_pad($counter_pack, 4, "\0", STR_PAD_LEFT);
+                return $counter_pack . $this->_nonce;
+            case 'chacha20':
+                /* The original ChaCha20 cipher with a 64-bit nonce and a 64-bit counter,
+                 * allowing a practically unlimited amount of data to be encrypted with the same
+                 * (key, nonce) pair 
+                 */
+                $counter_pack = gmp_export($counter, 8, GMP_LSW_FIRST);
+                $counter_pack = str_pad($counter_pack, 8, "\0", STR_PAD_LEFT);
+                return $counter_pack . $this->_nonce;
+            case 'aes-128-ctr':
+            case 'aes-192-ctr':
+            case 'aes-256-ctr':
+                $nonce = gmp_import($this->_nonce, 1, GMP_MSW_FIRST);
+                $counter_pack = gmp_export(gmp_add($nonce, $counter), 1, GMP_MSW_FIRST);
+                $counter_pack = str_pad($counter_pack, 16, "\0", STR_PAD_LEFT);
+                return $counter_pack;
+            default:
+                return  $this->_iv;
         }
     }
 
-    protected function chacha20_update($data)
+    protected function counter_mode_gen_iv()
     {
-        $len = strlen($data);
-        $padding = $this->_counter % static::BLOCK_SIZE;
-        if($padding)
-            $data = str_repeat("\0", $padding) . $data;
-        $iv = $this->fixIVForOpenssl($this->_iv);
-        $data = openssl_encrypt($data, "chacha20", $this->_key, OPENSSL_RAW_DATA, $iv);
-        $this->_counter += $len;
-        return substr($data, $padding);
+        $counter = intval($this->_counter / $this->_block_size);
+        switch($this->_algorithm) {
+            case 'chacha20-ietf':
+                //more: https://libsodium.gitbook.io/doc/advanced/stream_ciphers/chacha20
+                /* The IETF variant increases the nonce size to 96 bits,
+                 * but reduces the counter size down to 32 bits, allowing 
+                 * only up to 256 GB of data to be safely encrypted with a 
+                 * given (key, nonce) pair.
+                 */
+                $counter_pack = pack("V", $counter);
+                return $counter_pack . $this->_nonce;
+            case 'chacha20':
+                /* 此处为了兼容32位系统，使用32位counter */
+                $counter_pack = pack("V2", $counter, 0);
+                return $counter_pack . $this->_nonce;
+            case 'aes-128-ctr':
+            case 'aes-192-ctr':
+            case 'aes-256-ctr':
+                //todo: not dependent on gmp expansion
+                echo "unsupported encryption algorithm, please enable gmp expansion\n";
+                return $this->_nonce;
+            default:
+                return  $this->_iv;
+        }
     }
 }
 
@@ -295,29 +333,48 @@ class Decipher extends Encipher
 {
     public function update($data)
     {
-        if($this->_ischacha20) {
-            return $this->chacha20_update($data);
-        }
         if (strlen($data) == 0)
             return '';
         $tl = strlen($this->_tail);
         if ($tl)
             $data = $this->_tail . $data;
-        $b = openssl_decrypt($data, $this->_algorithm, $this->_key, OPENSSL_RAW_DATA, $this->_iv);
+        if(isset($this->_counter)) {
+            if($this->_gmp_support)
+                $iv = $this->counter_mode_gen_iv_by_gmp();
+            else
+                $iv = $this->counter_mode_gen_iv();
+        } else {
+            $iv = $this->_iv;
+        }
+        $b = openssl_decrypt($data, $this->_algorithm_openssl, $this->_key, OPENSSL_RAW_DATA, $iv);
         $result = substr($b, $tl);
         $dataLength = strlen($data);
-        $mod = $dataLength%$this->_ivLength;
-        if ($dataLength >= $this->_ivLength) {
-            $iPos = -($mod + $this->_ivLength);
-            $this->_iv = substr($data, $iPos, $this->_ivLength);
+        $mod = $dataLength % $this->_block_size;
+        if ($dataLength >= $this->_block_size) {
+            $iPos = -($mod + $this->_block_size);
+            $this->_iv = substr($data, $iPos, $this->_block_size);
         }
         $this->_tail = $mod!=0 ? substr($data, -$mod):'';
+        if(isset($this->_counter)) {
+            if($this->_gmp_support)
+                $this->_counter =  gmp_add($this->_counter, strval(strlen($result)) );
+            else
+                $this->_counter += strlen($result);
+        }
         return $result;
     }
 }
 
 class AEADEncipher
 {
+    const CHUNK_SIZE_LEN    = 2;
+    const AEAD_TAG_LEN      = 16;
+
+    const CRYPTO_ERROR      = -1;
+    const CRYPTO_NEED_MORE  = 0;
+    const CRYPTO_OK         = 1;
+
+    const CHUNK_SIZE_MASK   = 0x3FFF;
     protected $_algorithm;
     protected $_aead_tail;
     protected $_aead_subkey;
@@ -357,7 +414,7 @@ class AEADEncipher
         //UDP
         if($this->_aead_encipher_all) {
             $err = $this->aead_encrypt_all($this->_aead_iv, $this->_aead_subkey, $data);
-            if($err == CRYPTO_ERROR) {
+            if($err == static::CRYPTO_ERROR) {
                 echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD encrypt error\n";
                 return '';
             }
@@ -368,7 +425,7 @@ class AEADEncipher
         while(strlen($data) > 0) {
             $temp = '';
             $err = $this->aead_chunk_encrypt($this->_aead_iv, $this->_aead_subkey, $data, $temp);
-            if($err == CRYPTO_ERROR) {
+            if($err == static::CRYPTO_ERROR) {
                 echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD encrypt error\n";
                 return '';
             }
@@ -391,7 +448,7 @@ class AEADEncipher
          *
          */
         $buffer = $this->aead_encrypt($buffer, '', $iv, $subkey);
-        return CRYPTO_OK;
+        return static::CRYPTO_OK;
     }
 
     protected function aead_chunk_encrypt(&$iv, $subkey, &$buffer, &$result)
@@ -407,22 +464,22 @@ class AEADEncipher
          *
          */
         $plen = strlen($buffer);
-        if($plen > CHUNK_SIZE_MASK) {
-            $plen = CHUNK_SIZE_MASK;
+        if($plen > static::CHUNK_SIZE_MASK) {
+            $plen = static::CHUNK_SIZE_MASK;
         }
         $data = substr($buffer, 0, $plen);
         $plen_bin = pack('n', $plen);
         $result .= $this->aead_encrypt($plen_bin, '', $iv, $subkey);
-        if(strlen($result) !=  AEAD_TAG_LEN + CHUNK_SIZE_LEN) {
-            return CRYPTO_ERROR;
+        if(strlen($result) !=  static::AEAD_TAG_LEN + static::CHUNK_SIZE_LEN) {
+            return static::CRYPTO_ERROR;
         }
         if($this->_sodium_support)
             sodium_increment($iv);
         else
             $this->nonce_increment($iv);
         $result .= $this->aead_encrypt($data, '', $iv, $subkey);
-        if(strlen($result) !=  2*AEAD_TAG_LEN + CHUNK_SIZE_LEN + $plen) {
-            return CRYPTO_ERROR;
+        if(strlen($result) !=  2*static::AEAD_TAG_LEN + static::CHUNK_SIZE_LEN + $plen) {
+            return static::CRYPTO_ERROR;
         }
         if($this->_sodium_support)
             sodium_increment($iv);
@@ -430,7 +487,7 @@ class AEADEncipher
             $this->nonce_increment($iv);
         $this->_aead_chunk_id++;
         $buffer = substr($buffer, $plen);
-        return CRYPTO_OK;
+        return static::CRYPTO_OK;
     }
 
     protected function aead_encrypt($msg, $ad, $nonce, $key)
@@ -481,7 +538,7 @@ class AEADDecipher extends AEADEncipher
         //UDP
         if($this->_aead_encipher_all) {
             $err = $this->aead_decrypt_all($this->_aead_iv, $this->_aead_subkey, $data);
-            if($err == CRYPTO_ERROR) {
+            if($err == static::CRYPTO_ERROR) {
                 echo "[" .__FILE__ . " " . __LINE__ . "]" . "AEAD decrypt error\n";
                 return '';
             }
@@ -497,10 +554,10 @@ class AEADDecipher extends AEADEncipher
         $result = '';
         while(strlen($data) > 0) {
             $err = $this->aead_chunk_decrypt($this->_aead_iv, $this->_aead_subkey, $data, $result);
-            if($err == CRYPTO_ERROR) {
+            if($err == static::CRYPTO_ERROR) {
                 echo "[ " . __LINE__ . "]" . "AEAD decrypt error\n";
                 return '';
-            } else if($err == CRYPTO_NEED_MORE) {
+            } else if($err == static::CRYPTO_NEED_MORE) {
                 if( strlen($data) == 0 ) {
                     echo "[ " . __LINE__ . "]" . "AEAD decrypt error\n";
                     return '';
@@ -528,12 +585,12 @@ class AEADDecipher extends AEADEncipher
          *
          */
         //验证chunk长度
-        if(strlen($buffer) <= AEAD_TAG_LEN) {
-            return CRYPTO_ERROR;
+        if(strlen($buffer) <= static::AEAD_TAG_LEN) {
+            return static::CRYPTO_ERROR;
         }
 
         $buffer = $this->aead_decrypt($buffer, '', $iv, $subkey);
-        return CRYPTO_OK;
+        return static::CRYPTO_OK;
     }
 
     protected function aead_chunk_decrypt(&$iv, $subkey, &$buffer, &$result)
@@ -549,24 +606,24 @@ class AEADDecipher extends AEADEncipher
          *
          */
         //验证chunk长度
-        if(strlen($buffer) <= 2 * AEAD_TAG_LEN + CHUNK_SIZE_LEN) {
-            return CRYPTO_NEED_MORE;
+        if(strlen($buffer) <= 2 * static::AEAD_TAG_LEN + static::CHUNK_SIZE_LEN) {
+            return static::CRYPTO_NEED_MORE;
         }
 
-        $payload_length_enc_length = AEAD_TAG_LEN + CHUNK_SIZE_LEN;
+        $payload_length_enc_length = static::AEAD_TAG_LEN + static::CHUNK_SIZE_LEN;
         $payload_length_enc = substr($buffer, 0, $payload_length_enc_length);
 
         $mlen = $this->aead_decrypt($payload_length_enc, '', $iv, $subkey);
-        if(strlen($mlen) != CHUNK_SIZE_LEN) {
+        if(strlen($mlen) != static::CHUNK_SIZE_LEN) {
             echo "[ " . __LINE__ . "]" . "mlen error! id: " . $this->_aead_chunk_id . "\n";
-            return CRYPTO_ERROR;
+            return static::CRYPTO_ERROR;
         }
         $payload_length = unpack('n', $mlen);
-        $payload_length = intval($payload_length[1]) & CHUNK_SIZE_MASK;
-        $payload_enc_length = $payload_length + AEAD_TAG_LEN;
+        $payload_length = intval($payload_length[1]) & static::CHUNK_SIZE_MASK;
+        $payload_enc_length = $payload_length + static::AEAD_TAG_LEN;
         //验证payload长度
         if(strlen($buffer) - $payload_length_enc_length < $payload_enc_length) {
-            return CRYPTO_NEED_MORE;
+            return static::CRYPTO_NEED_MORE;
         }
         $buffer = substr($buffer, $payload_length_enc_length);
         $payload_enc = substr($buffer, 0, $payload_enc_length);
@@ -581,7 +638,7 @@ class AEADDecipher extends AEADEncipher
         else
             $this->nonce_increment($iv);
         $this->_aead_chunk_id++;
-        return CRYPTO_OK;
+        return static::CRYPTO_OK;
     }
 
     protected function aead_decrypt($msg, $ad, $nonce, $key)
@@ -604,7 +661,7 @@ class AEADDecipher extends AEADEncipher
             case 'aes-128-gcm':
             case 'aes-192-gcm':
             case 'aes-256-gcm':
-                $data_len = strlen($msg)-AEAD_TAG_LEN;
+                $data_len = strlen($msg) - static::AEAD_TAG_LEN;
                 $data = substr($msg, 0, $data_len);
                 $tag = substr($msg, $data_len);
                 return openssl_decrypt($data, $this->_algorithm, $key, OPENSSL_RAW_DATA, $nonce, $tag, $ad);
