@@ -305,12 +305,6 @@ class Encipher
         $counter = intval($this->_counter / $this->_block_size);
         switch($this->_algorithm) {
             case 'chacha20-ietf':
-                //more: https://libsodium.gitbook.io/doc/advanced/stream_ciphers/chacha20
-                /* The IETF variant increases the nonce size to 96 bits,
-                 * but reduces the counter size down to 32 bits, allowing 
-                 * only up to 256 GB of data to be safely encrypted with a 
-                 * given (key, nonce) pair.
-                 */
                 $counter_pack = pack("V", $counter);
                 return $counter_pack . $this->_nonce;
             case 'chacha20':
@@ -320,12 +314,37 @@ class Encipher
             case 'aes-128-ctr':
             case 'aes-192-ctr':
             case 'aes-256-ctr':
-                //todo: not dependent on gmp expansion
-                echo "unsupported encryption algorithm, please enable gmp expansion\n";
-                return $this->_nonce;
+                $counter_pack = pack("N", $counter);
+                return $this->msb_number_add($this->_nonce, $counter_pack);
             default:
                 return  $this->_iv;
         }
+    }
+
+    protected function msb_number_add($a, $b)
+    {
+        $la = strlen($a);
+        $lb = strlen($b);
+        if($la > $lb) {
+            $base = strrev($a);
+            $add = strrev($b);
+            $base_len = $la;
+            $add_len = $lb;
+        } else {
+            $base = strrev($b);
+            $add = strrev($a);
+            $base_len = $lb;
+            $add_len = $la;
+        }
+        $c = 0;
+        for($i=0; $i<$base_len; $i++) {
+            if($i < $add_len)
+                $c += ord($add[$i]);
+            $sum = $c + ord($base[$i]);
+            $base[$i] = chr($sum % 256);
+            $c = intval($sum / 256);
+        }
+        return strrev($base);
     }
 }
 
