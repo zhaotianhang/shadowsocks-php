@@ -18,12 +18,14 @@
  */
 class Encryptor
 {
+    protected $_password;
     protected $_key;
     protected $_method;
     protected $_cipher;
     protected $_decipher;
     protected $_bytesToKeyResults = array();
-    protected $_cipherIv;
+    protected $_send_iv;
+    protected $_recv_iv;
     protected $_ivSent;
     protected $_onceMode;
     protected static $_methodSupported = array(
@@ -33,6 +35,7 @@ class Encryptor
         'aes-128-cfb'=> array(16, 16),
         'aes-192-cfb'=> array(24, 16),
         'aes-256-cfb'=> array(32, 16),
+        'aes-128-cbc'=> array(16, 16),
         'bf-cfb'=> array(16, 8),
         'camellia-128-cfb'=> array(16, 16),
         'camellia-192-cfb'=> array(24, 16),
@@ -41,8 +44,9 @@ class Encryptor
         'des-cfb'=> array(8, 8),
         'idea-cfb'=>array(16, 8),
         'rc2-cfb'=> array(16, 8),
-        //'rc4'=> array(16, 0),      //rc4的iv长度为0，会有问题，暂时去掉
-        //'rc4-md5'=> array(16, 16), //php的openssl找不到rc4-md5这个算法，暂时去掉
+        'rc4'=> array(16, 0),
+        'rc4-md5'=> array(16, 16),
+        'rc4-md5-6'=> array(16, 6),
         'seed-cfb'=> array(16, 16),
         'chacha20'=> array(32, 8),  //OpenSSL
         'chacha20-ietf'=> array(32, 12),  //OpenSSL
@@ -56,48 +60,78 @@ class Encryptor
 
     public function __construct($key, $method, $onceMode = false)
     {
-        $this->_key = $key;
-        $this->_method = $method;
+        $this->_password = $key;
+        $this->_method = strtolower($method);
         $this->_ivSent = false;
         $this->_onceMode = $onceMode;
         $iv_len = $this->getCipherLen($this->_method);
         $iv_len = $iv_len[1];
         $iv = openssl_random_pseudo_bytes($iv_len);
-        $this->_cipher = $this->getCipher($this->_key, $this->_method, 1, $iv);
+        $this->_cipher = $this->getCipher($this->_password, $this->_method, 1, $iv);
     }
 
     protected function getCipher($password, $method, $op, $iv)
     {
-        $method = strtolower($method);
         $m = $this->getCipherLen($method);
         if($m) {
             $ref = $this->EVPBytesToKey($password, $m[0], $m[1]);
-            $key = $ref[0];
+            $this->_key = $key = $ref[0];
             $iv_ = $ref[1];
             if ($iv == null) {
                 $iv = $iv_;
             }
             $iv = substr($iv, 0, $m[1]);
             if ($op === 1) {
-                $this->_cipherIv = $iv;
-            }
-            if($this->checkAEADMethod($method)) {
-                $salt = $iv;
-                if($op === 1) {
-                    return new AEADEncipher($method, $key, $salt, $this->_onceMode);
-                } else {
-                    return new AEADDecipher($method, $key, $salt, $this->_onceMode);
-                }
-            } else if ($method === 'rc4-md5') {
-                return $this->createRc4Md5Cipher($key, $iv, $op);
+                $this->_send_iv = $iv;
             } else {
-                if($op === 1) {
-                    return new Encipher($method, $key, $iv);
-                } else {
-                    return new Decipher($method, $key, $iv);
-                }
+                $this->_recv_iv = $iv;
+            }
+            switch($method) {
+                case 'rc4':
+                    return new RC4Encipher($key);
+                case 'rc4-md5':
+                case 'rc4-md5-6':
+                    $rc4_key = md5($key.$iv, true);
+                    return new RC4Encipher($rc4_key);
+                case 'aes-128-gcm':
+                case 'aes-192-gcm':
+                case 'aes-256-gcm':
+                case 'chacha20-poly1305':
+                case 'chacha20-ietf-poly1305':
+                case 'xchacha20-ietf-poly1305':
+                    $salt = $iv;
+                    if($op === 1) {
+                        return new AEADEncipher($method, $key, $salt, $this->_onceMode);
+                    } else {
+                        return new AEADDecipher($method, $key, $salt, $this->_onceMode);
+                    }
+                case 'aes-128-ctr':
+                case 'aes-192-ctr':
+                case 'aes-256-ctr':
+                case 'chacha20':
+                case 'chacha20-ietf':
+                    return new CtrEncipher($method, $key, $iv);
+                default:
+                    if($op === 1) {
+                        return new CfbEncipher($method, $key, $iv);
+                    } else {
+                        return new CfbDecipher($method, $key, $iv);
+                    }
             }
         }
+    }
+
+    public function getKey()
+    {
+        return $this->_key;
+    }
+
+    public function getIV($send = false)
+    {
+        if($send)
+            return $this->_send_iv;
+        else
+            return $this->_recv_iv;
     }
 
     public function encrypt($buffer)
@@ -108,7 +142,7 @@ class Encryptor
                 return $result;
             } else {
               $this->_ivSent = true;
-              return $this->_cipherIv . $result;
+              return $this->_send_iv . $result;
             }
         }
     }
@@ -120,23 +154,13 @@ class Encryptor
                 $decipher_iv_len = $this->getCipherLen($this->_method);
                 $decipher_iv_len = $decipher_iv_len[1];
                 $decipher_iv = substr($buffer, 0, $decipher_iv_len);
-                $this->_decipher = $this->getCipher($this->_key, $this->_method, 0, $decipher_iv);
+                $this->_decipher = $this->getCipher($this->_password, $this->_method, 0, $decipher_iv);
                 $result = $this->_decipher->update(substr($buffer, $decipher_iv_len));
                 return $result;
             } else {
                 $result = $this->_decipher->update($buffer);
                 return $result;
             }
-        }
-    }
-
-    protected function createRc4Md5Cipher($key, $iv, $op)
-    {
-        $rc4_key = md5($key.$iv);
-        if($op === 1) {
-            return new Encipher('rc4', $rc4_key, '');
-        } else  {
-            return Decipher('rc4', $rc4_key, '');
         }
     }
 
@@ -171,41 +195,63 @@ class Encryptor
     
     protected function getCipherLen($method)
     {
-        $method = strtolower($method);
         return isset(self::$_methodSupported[$method]) ? self::$_methodSupported[$method] : null;
-    }
-
-    protected function checkAEADMethod($method)
-    {
-        if($method == 'aes-128-gcm') {
-            return true;
-        }
-        if($method == 'aes-192-gcm') {
-            return true;
-        }       
-        if($method == 'aes-256-gcm') {
-            return true;
-        }
-        if($method == 'chacha20-poly1305') {
-            return true;
-        }        
-        if($method == 'chacha20-ietf-poly1305') {
-            return true;
-        }
-        if($method == 'xchacha20-ietf-poly1305') {
-            return true;
-        }
-        return false;
     }
 }
 
-class Encipher
+class RC4Encipher
+{
+    protected $s;
+    protected $_i;
+    protected $_j;
+
+    public function __construct($key)
+    {
+        $this->s = array();
+        for ($i=0; $i<256; $i++) {
+            $this->s[$i] = $i;
+        }
+
+        $j = 0;
+        $key_len = strlen($key);
+        for ($i=0; $i<256; $i++) {
+            $j = ($j + $this->s[$i] + ord($key[$i % $key_len])) % 256;
+            //swap
+            $x = $this->s[$i];
+            $this->s[$i] = $this->s[$j];
+            $this->s[$j] = $x;
+        }
+        $this->_i = 0;
+        $this->_j = 0;
+    }
+
+    public function update($data)
+    {
+        $i = $this->_i;
+        $j = $this->_j;
+        $out_buf = '';
+        $data_len = strlen($data);
+        for ($y=0; $y< $data_len; $y++) {
+            $i = ($i + 1) % 256;
+            $j = ($j + $this->s[$i]) % 256;
+            //swap
+            $x = $this->s[$i];
+            $this->s[$i] = $this->s[$j];
+            $this->s[$j] = $x;
+            $out_buf .= $data[$y] ^ chr($this->s[($this->s[$i] + $this->s[$j]) % 256]);
+        }
+        $this->_i = $i;
+        $this->_j = $j;
+        return $out_buf;
+    }
+}
+
+class CtrEncipher
 {
     const BLOCK_SIZE = 64;
     protected $_algorithm;
     protected $_algorithm_openssl;
     protected $_key;
-    protected $_iv;
     protected $_tail;
     protected $_block_size;
 
@@ -213,16 +259,13 @@ class Encipher
     {
         $this->_algorithm = $algorithm;
         $this->_key = $key;
-        $this->_iv = $iv;
-        if(strpos($algorithm, "chacha20") !== false || strpos($algorithm, "ctr") !== false) {
-            $this->_nonce = $iv;
-            if(function_exists('gmp_init')) {
-                $this->_counter = gmp_init('0');
-                $this->_gmp_support = true;
-            } else {
-                $this->_counter = 0;
-                $this->_gmp_support = false;
-            }
+        $this->_nonce = $iv;
+        if(function_exists('gmp_init')) {
+            $this->_counter = gmp_init('0');
+            $this->_gmp_support = true;
+        } else {
+            $this->_counter = 0;
+            $this->_gmp_support = false;
         }
         if(strpos($algorithm, "chacha20") !== false) {
             $this->_block_size = static::BLOCK_SIZE;
@@ -237,32 +280,22 @@ class Encipher
     {
         if (strlen($data) == 0)
             return '';
+        if($this->_gmp_support) {
+            $iv = $this->counter_mode_gen_iv_by_gmp();
+            $this->_counter =  gmp_add($this->_counter, strval(strlen($data)) );
+        } else {
+            $iv = $this->counter_mode_gen_iv();
+            $this->_counter += strlen($data);
+        }
+
         $tl = strlen($this->_tail);
         if ($tl)
             $data = $this->_tail . $data;
-        if(isset($this->_counter)) {
-            if($this->_gmp_support)
-                $iv = $this->counter_mode_gen_iv_by_gmp();
-            else
-                $iv = $this->counter_mode_gen_iv();
-        } else {
-            $iv = $this->_iv;
-        }
         $b = openssl_encrypt($data, $this->_algorithm_openssl, $this->_key, OPENSSL_RAW_DATA, $iv);
         $result = substr($b, $tl);
         $dataLength = strlen($data);
         $mod = $dataLength % $this->_block_size;
-        if ($dataLength >= $this->_block_size) {
-            $iPos = -($mod + $this->_block_size);
-            $this->_iv = substr($b, $iPos, $this->_block_size);
-        }
         $this->_tail = $mod!=0 ? substr($data, -$mod):'';
-        if(isset($this->_counter)) {
-            if($this->_gmp_support)
-                $this->_counter =  gmp_add($this->_counter, strval(strlen($result)) );
-            else
-                $this->_counter += strlen($result);
-        }
         return $result;
     }
 
@@ -296,7 +329,7 @@ class Encipher
                 $counter_pack = str_pad($counter_pack, 16, "\0", STR_PAD_LEFT);
                 return $counter_pack;
             default:
-                return  $this->_iv;
+                return $this->_iv;
         }
     }
 
@@ -348,7 +381,44 @@ class Encipher
     }
 }
 
-class Decipher extends Encipher
+class CfbEncipher
+{
+    protected $_algorithm;
+    protected $_algorithm_openssl;
+    protected $_key;
+    protected $_iv;
+    protected $_tail;
+    protected $_block_size;
+
+    public function __construct($algorithm, $key, $iv)
+    {
+        $this->_algorithm = $algorithm;
+        $this->_key = $key;
+        $this->_iv = $iv;
+        $this->_block_size = openssl_cipher_iv_length($this->_algorithm);
+    }
+
+    public function update($data)
+    {
+        if (strlen($data) == 0)
+            return '';
+        $tl = strlen($this->_tail);
+        if ($tl)
+            $data = $this->_tail . $data;
+        $b = openssl_encrypt($data, $this->_algorithm, $this->_key, OPENSSL_RAW_DATA, $this->_iv);
+        $result = substr($b, $tl);
+        $dataLength = strlen($data);
+        $mod = $dataLength % $this->_block_size;
+        if ($dataLength >= $this->_block_size) {
+            $iPos = -($mod + $this->_block_size);
+            $this->_iv = substr($b, $iPos, $this->_block_size);
+        }
+        $this->_tail = $mod!=0 ? substr($data, -$mod):'';
+        return $result;
+    }
+}
+
+class CfbDecipher extends CfbEncipher
 {
     public function update($data)
     {
@@ -357,15 +427,7 @@ class Decipher extends Encipher
         $tl = strlen($this->_tail);
         if ($tl)
             $data = $this->_tail . $data;
-        if(isset($this->_counter)) {
-            if($this->_gmp_support)
-                $iv = $this->counter_mode_gen_iv_by_gmp();
-            else
-                $iv = $this->counter_mode_gen_iv();
-        } else {
-            $iv = $this->_iv;
-        }
-        $b = openssl_decrypt($data, $this->_algorithm_openssl, $this->_key, OPENSSL_RAW_DATA, $iv);
+        $b = openssl_decrypt($data, $this->_algorithm, $this->_key, OPENSSL_RAW_DATA, $this->_iv);
         $result = substr($b, $tl);
         $dataLength = strlen($data);
         $mod = $dataLength % $this->_block_size;
@@ -374,12 +436,6 @@ class Decipher extends Encipher
             $this->_iv = substr($data, $iPos, $this->_block_size);
         }
         $this->_tail = $mod!=0 ? substr($data, -$mod):'';
-        if(isset($this->_counter)) {
-            if($this->_gmp_support)
-                $this->_counter =  gmp_add($this->_counter, strval(strlen($result)) );
-            else
-                $this->_counter += strlen($result);
-        }
         return $result;
     }
 }
