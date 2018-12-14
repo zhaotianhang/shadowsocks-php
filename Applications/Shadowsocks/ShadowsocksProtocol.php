@@ -121,6 +121,7 @@ class AuthAesProtocol
     protected $_pack_id;
     protected $_user_key;
     protected $_user_id;
+    protected static $_padding_data = true;
     protected static $_server_info = array(
         'data' => array(
             'connection_id' => 0xffffffff,
@@ -137,21 +138,32 @@ class AuthAesProtocol
 
     public function __construct($key, $iv, $protocol, $param)
     {
+        assert(is_array($param), "\$param type error\n");
+        assert(is_string($protocol), "\$protocol type error\n");
+        assert(is_string($iv), "\$iv type error\n");
+        assert(is_string($key), "\$key type error\n");
+
         $this->_key = $key;
         $this->_recv_iv = $iv;
         $this->_protocol = $protocol;
+        $this->_hashfunc = self::$_protocolSupported[$this->_protocol];
         $this->_param = array();
-        foreach ($param as $value) {
-            $t = explode(':', $value);
-            $this->_param[$t[0]] = $t[1];
-            if(!isset($this->_user_id)) {
-                $this->_user_id = $t[0];
+        if( count($param) === 0) {
+            $this->_user_key = $key;
+            $this->_user_id = rand(0, 0x7fffffff);
+        } else {
+            foreach ($param as $value) {
+                $t = explode(':', $value);
+                $this->_param[$t[0]] = $t[1];
+                if(!isset($this->_user_id)) {
+                    $this->_user_id = $t[0];
+                }
             }
+            $this->_user_key = hash($this->_hashfunc, $this->_param[$this->_user_id], true);
         }
         $this->_recv_buf = '';
         $this->_has_recv_header = false;
         $this->_has_send_header = false;
-        $this->_hashfunc = self::$_protocolSupported[$this->_protocol];
         $this->_recv_id = 1;
         $this->_pack_id = 1;
         if(self::$_server_info['data']['connection_id'] == 0xffffffff) {
@@ -274,7 +286,6 @@ class AuthAesProtocol
                 $part1 = substr($this->_recv_buf, 0, 7);
                 $part1_my = hash_hmac($this->_hashfunc, $part1[0], $hmac_key, true);
                 $part1_my = substr($part1_my, 0, 6);
-                echo bin2hex($part1) . " [" . bin2hex($part1_my) . "]\n";
                 if( substr($part1, -6) !== $part1_my) {
                     echo "part1 data uncorrect auth HMAC-SHA1\n";
                     return false;
@@ -298,15 +309,16 @@ class AuthAesProtocol
 
             $this->_user_id = $uid['uid'];
             if( !isset($this->_param[$this->_user_id])) {
-                echo "user id is unknow\n";
-                return false;
-            }
-
-            if($this->_hashfunc == 'md5') {
-                $this->_user_key = md5($this->_param[$this->_user_id], true);
+                if( count($this->_param) === 0) {
+                    $this->_user_key = $this->_key;
+                } else {
+                    echo "user id is unknow\n";
+                    return false;
+                }
             } else {
-                $this->_user_key = sha1($this->_param[$this->_user_id], true);
+                $this->_user_key = hash($this->_hashfunc, $this->_param[$this->_user_id], true);
             }
+            echo 'user id:' . $this->_user_id . "\n";
 
             $part2_enc_part_key = md5(base64_encode($this->_user_key) . $this->_protocol, true);
             $part2_enc_part = substr($part2, 4, 16);
@@ -317,7 +329,7 @@ class AuthAesProtocol
             }
             //---------------------------------------------------------------------
             $aes_enc_part = unpack('V1utc/V1cid/V1conid/v1plen/v1rlen', $part2_enc_part);
-            var_dump($aes_enc_part);
+            //var_dump($aes_enc_part);
             if( strlen($this->_recv_buf) < $aes_enc_part['plen'] ) {
                 //need more
                 return false;
@@ -371,7 +383,7 @@ class AuthAesProtocol
                 break;
             }
 
-            echo $block_size . " <-- block_size\n";
+            //echo $block_size . " <-- block_size\n";
             $block = substr($this->_recv_buf, 0, $block_size);
             $this->_recv_buf = substr($this->_recv_buf, $block_size);
             $this_my = hash_hmac($this->_hashfunc, substr($block, 0, $block_size-4), $hmac_key, true);
@@ -444,17 +456,19 @@ class AuthAesProtocol
     {
         if( strlen($buf) == 0)
             return '';
+        if( strlen($buf) > 400)
+            $rnd_len = rand(0, 100);
+        else
+            $rnd_len = rand(0, 800);
+        if(!self::$_padding_data) {
+            $rnd_len = 0;
+        }
         //---------------------part2-----------------------
         $data = $auth_data;
-        $data_len = 7 + 4 + 16 + 4 + 0 + strlen($buf) + 4;
-        $data = $data . pack('v', $data_len) . pack('v', 0);
+        $data_len = 7 + 4 + 16 + 4 + $rnd_len + strlen($buf) + 4;
+        $data = $data . pack('v', $data_len) . pack('v', $rnd_len);
         $hmac_key = $this->_recv_iv . $this->_key;
         $uid = pack('V', $this->_user_id);
-        if($this->_hashfunc == 'md5') {
-            $this->_user_key = md5($this->_param[$this->_user_id], true);
-        } else {
-            $this->_user_key = sha1($this->_param[$this->_user_id], true);
-        }
         $part2_enc_part_key = md5(base64_encode($this->_user_key) . $this->_protocol, true);
         $data = openssl_encrypt($data, 'AES-128-ECB', $part2_enc_part_key, OPENSSL_RAW_DATA);
         $data = $uid . substr($data, 0, 16);
@@ -467,7 +481,8 @@ class AuthAesProtocol
         $handshake_my = substr($handshake_my, 0, 6);
         $check_head .= $handshake_my;
         //---------------------part3-----------------------
-        $pack = $check_head . $data . '' . $buf;
+        $data_rnd = openssl_random_pseudo_bytes($rnd_len);
+        $pack = $check_head . $data . $data_rnd . $buf;
         $handshake_my = hash_hmac($this->_hashfunc, $pack, $this->_user_key, true);
         $handshake_my = substr($handshake_my, 0, 4);
         $pack .= $handshake_my;
