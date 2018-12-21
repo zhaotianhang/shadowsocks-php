@@ -29,13 +29,10 @@ class Encryptor
     protected $_ivSent;
     protected $_onceMode;
     protected static $_methodSupported = array(
-        'aes-128-ctr'=> array(16, 16), //gmp, OpenSSL
-        'aes-192-ctr'=> array(24, 16), //gmp, OpenSSL
-        'aes-256-ctr'=> array(32, 16), //gmp, OpenSSL
+        'none'=> array(16, 0),
         'aes-128-cfb'=> array(16, 16),
         'aes-192-cfb'=> array(24, 16),
         'aes-256-cfb'=> array(32, 16),
-        'aes-128-cbc'=> array(16, 16),
         'bf-cfb'=> array(16, 8),
         'camellia-128-cfb'=> array(16, 16),
         'camellia-192-cfb'=> array(24, 16),
@@ -44,10 +41,13 @@ class Encryptor
         'des-cfb'=> array(8, 8),
         'idea-cfb'=>array(16, 8),
         'rc2-cfb'=> array(16, 8),
+        'seed-cfb'=> array(16, 16),
         'rc4'=> array(16, 0),
         'rc4-md5'=> array(16, 16),
         'rc4-md5-6'=> array(16, 6),
-        'seed-cfb'=> array(16, 16),
+        'aes-128-ctr'=> array(16, 16), //gmp, OpenSSL
+        'aes-192-ctr'=> array(24, 16), //gmp, OpenSSL
+        'aes-256-ctr'=> array(32, 16), //gmp, OpenSSL
         'chacha20'=> array(32, 8),  //OpenSSL
         'chacha20-ietf'=> array(32, 12),  //OpenSSL
         'aes-128-gcm'=> array(16, 16),  //(PHP >= 7.1.0) OpenSSL 对于AEAD，第二个参数是salt长度
@@ -87,6 +87,8 @@ class Encryptor
                 $this->_recv_iv = $iv;
             }
             switch($method) {
+                case 'none':
+                    return new NoneEncipher();
                 case 'rc4':
                     return new RC4Encipher($key);
                 case 'rc4-md5':
@@ -196,6 +198,14 @@ class Encryptor
     protected function getCipherLen($method)
     {
         return isset(self::$_methodSupported[$method]) ? self::$_methodSupported[$method] : null;
+    }
+}
+
+class NoneEncipher
+{
+    public function update($data)
+    {
+        return $data;
     }
 }
 

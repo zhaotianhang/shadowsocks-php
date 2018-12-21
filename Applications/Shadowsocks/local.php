@@ -35,23 +35,23 @@ define('CMD_BIND', 2);
 define('CMD_UDP_ASSOCIATE', 3);
 
 // 初始化worker，监听$LOCAL_PORT端口
-$worker = new Worker('tcp://0.0.0.0:'.$LOCAL_PORT);
+$worker = new Worker('tcp://0.0.0.0:'. $LOCAL_PORT);
 // 进程数量
 $worker->count = $PROCESS_COUNT;
 // 名称
 $worker->name = 'shadowsocks-local';
-// 如果加密算法为table，初始化table
-if($METHOD == 'table')
-{
-    Encryptor::initTable($PASSWORD);
-}
+
 // 当客户端连上来时
-$worker->onConnect = function($connection)use($METHOD, $PASSWORD)
+$worker->onConnect = function($connection)use($METHOD, $PASSWORD, $PROTOCOL, $PROTOCOL_PARAM)
 {
     // 设置当前连接的状态为STAGE_INIT，初始状态
     $connection->stage = STAGE_INIT;
     // 初始化加密类
     $connection->encryptor = new Encryptor($PASSWORD, $METHOD);
+    $iv = $connection->encryptor->getIV(true);
+    $key = $connection->encryptor->getKey();
+    // 初始化协议类
+    $connection->ssprotocol = new ShadowsocksProtocol($key, $iv, $PROTOCOL, $PROTOCOL_PARAM);
 };
 
 // 当客户端发来消息时
@@ -94,7 +94,9 @@ $worker->onMessage = function($connection, $buffer)use($LOCAL_PORT, $SERVER, $PO
             // 远程连接发来消息时，进行解密，转发给客户端
             $remote_connection->onMessage = function($remote_connection, $buffer)
             {
-                $remote_connection->opposite->send($remote_connection->opposite->encryptor->decrypt($buffer));
+                $buffer = $remote_connection->opposite->encryptor->decrypt($buffer);
+                $buffer = $remote_connection->opposite->ssprotocol->ClientPostDecrypt($buffer);
+                $remote_connection->opposite->send($buffer);
             };
             // 远程连接断开时，则断开客户端的连接
             $remote_connection->onClose = function($remote_connection)
@@ -123,9 +125,11 @@ $worker->onMessage = function($connection, $buffer)use($LOCAL_PORT, $SERVER, $PO
                 $connection->opposite->resumeRecv();
             };
             // 当客户端发来数据时，加密数据，并发给远程服务端
-            $connection->onMessage = function($connection, $data)
+            $connection->onMessage = function($connection, $buffer)
             {
-                $connection->opposite->send($connection->encryptor->encrypt($data));
+                $buffer = $connection->ssprotocol->ClientPreEncrypt($buffer);
+                $buffer = $connection->encryptor->encrypt($buffer);
+                $connection->opposite->send($buffer);
             };
             // 当客户端关闭连接时，关闭远程服务端的连接
             $connection->onClose = function($connection)
@@ -149,6 +153,7 @@ $worker->onMessage = function($connection, $buffer)use($LOCAL_PORT, $SERVER, $PO
             $connection->state = STAGE_STREAM;
             //转发首个数据包，包含由客户端封装的目标地址，端口号等信息
             $buffer = substr($buffer, 3);
+            $buffer = $connection->ssprotocol->ClientPreEncrypt($buffer);
             $buffer = $connection->encryptor->encrypt($buffer);
             $remote_connection->send($buffer);
     }

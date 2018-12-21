@@ -12,14 +12,13 @@
  * @license http://www.opensource.org/licenses/mit-license.php MIT License
  */
 use \Workerman\Worker;
-use \Workerman\Connection\UdpConnection;
 use \Workerman\Connection\AsyncTcpConnection;
-use \Workerman\Connection\AsyncUdpConnection;
 use \Workerman\Autoloader;
 
 // 自动加载类
 require_once __DIR__ . '/../../Workerman/Autoloader.php';
 require_once __DIR__.'/config.php';
+require_once __DIR__.'/socks5.php';
 Autoloader::setRootPath(__DIR__);
 
 // 状态相关
@@ -42,7 +41,9 @@ define('ADDRTYPE_IPV6', 4);
 define('ADDRTYPE_HOST', 3);
 
 // 初始化worker，监听$PORT端口
-$worker = new Worker('tcp://0.0.0.0:'.$PORT);
+$worker = new Worker('tcp://0.0.0.0:'. $PORT);
+$worker->count = $PROCESS_COUNT;
+$worker->name = 'shadowsocks-server';
 
 // 当shadowsocks客户端连上来时
 $worker->onConnect = function($connection)use($METHOD, $PASSWORD)
@@ -54,7 +55,7 @@ $worker->onConnect = function($connection)use($METHOD, $PASSWORD)
 };
 
 // 当shadowsocks客户端发来消息时
-$worker->onMessage = function($connection, $buffer)
+$worker->onMessage = function($connection, $buffer)use($PROTOCOL, $PROTOCOL_PARAM)
 {
     // 判断当前连接的状态
     switch($connection->stage)
@@ -64,6 +65,17 @@ $worker->onMessage = function($connection, $buffer)
         case STAGE_ADDR:
             // 先解密数据
             $buffer = $connection->encryptor->decrypt($buffer);
+            $iv = $connection->encryptor->getIV(false);
+            $key = $connection->encryptor->getKey();
+            // 初始化协议类
+            $connection->ssprotocol = new ShadowsocksProtocol($key, $iv, $PROTOCOL, $PROTOCOL_PARAM);
+            $buffer = $connection->ssprotocol->ServerPostDecrypt($buffer);
+            // 解析协议出错，则关闭连接
+            if($buffer === false) {
+                $connection->close();
+                return;
+            }
+
             // 解析socket5头
             $header_data = parse_socket5_header($buffer);
             // 解析头部出错，则关闭连接
@@ -99,7 +111,9 @@ $worker->onMessage = function($connection, $buffer)
             // 远程连接发来消息时，进行加密，转发给shadowsocks客户端，shadowsocks客户端会解密转发给浏览器
             $remote_connection->onMessage = function($remote_connection, $buffer)
             {
-                $remote_connection->opposite->send($remote_connection->opposite->encryptor->encrypt($buffer));
+                $buffer = $remote_connection->opposite->ssprotocol->ServerPreEncrypt($buffer);
+                $buffer = $remote_connection->opposite->encryptor->encrypt($buffer);
+                $remote_connection->opposite->send($buffer);
             };
             // 远程连接断开时，则断开shadowsocks客户端的连接
             $remote_connection->onClose = function($remote_connection)
@@ -130,9 +144,11 @@ $worker->onMessage = function($connection, $buffer)
                 $connection->opposite->resumeRecv();
             };
             // 当shadowsocks客户端发来数据时，解密数据，并发给远程服务端
-            $connection->onMessage = function($connection, $data)
+            $connection->onMessage = function($connection, $buffer)
             {
-                $connection->opposite->send($connection->encryptor->decrypt($data));
+                $buffer = $connection->encryptor->decrypt($buffer);
+                $buffer = $connection->ssprotocol->ServerPostDecrypt($buffer);
+                $connection->opposite->send($buffer);
             };
             // 当shadowsocks客户端关闭连接时，关闭远程服务端的连接
             $connection->onClose = function($connection)
@@ -161,153 +177,6 @@ $worker->onMessage = function($connection, $buffer)
             }
     }
 };
-
-// UDP support
-$worker_udp = new Worker('udp://0.0.0.0:'.$PORT);
-
-// 进程数量
-$worker_udp->count=$worker->count = $PROCESS_COUNT;
-// 名称
-$worker_udp->name=$worker->name = 'shadowsocks-server';
-
-$worker_udp->onMessage = function($connection, $buffer)use($METHOD, $PASSWORD)
-{
-    if (is_null(@$connection->encryptor)){
-        $connection->encryptor = new Encryptor($PASSWORD, $METHOD, true);
-    }
-    $buffer = $connection->encryptor->decrypt($buffer);
-    // 解析socket5头
-    $header_data = parse_socket5_header($buffer);
-    // 解析头部出错，则关闭连接
-    if(!$header_data)
-    {
-        $connection->close();
-        return;
-    }
-    // 头部长度
-    $header_len = $header_data[3];
-    $host = $header_data[1];
-    $port = $header_data[2];
-    $address = "udp://$host:$port";
-
-    $remote_connection = new AsyncUdpConnection($address);
-    @$remote_connection->source = $connection;
-    $remote_connection->onConnect = function ($remote_connection)use ($buffer, $header_len)
-    {
-        $remote_connection->send(substr($buffer,$header_len));
-    };
-    $remote_connection->onMessage = function ($remote_connection, $buffer)use($header_data)
-    {
-        $_header = pack_header($header_data[1], $header_data[0], $header_data[2]);
-        $_data = $remote_connection->source->encryptor->encrypt($_header . $buffer);
-        $remote_connection->source->send($_data);
-    };
-    $remote_connection->connect();
-};
-
-/**
- * 解析shadowsocks客户端发来的socket5头部数据
- * @param string $buffer
- */
-function parse_socket5_header($buffer)
-{
-    /*
-     * Shadowsocks TCP Relay Header:
-     *
-     *    +------+----------+----------+
-     *    | ATYP | DST.ADDR | DST.PORT |
-     *    +------+----------+----------+
-     *    |  1   | Variable |    2     |
-     *    +------+----------+----------+
-     *
-     */
-    //检查长度
-    if( strlen($buffer) < 1 ) {
-        echo "invalid length for header\n";
-        return false;
-    }
-    $addr_type = ord($buffer[0]);
-    switch($addr_type)
-    {
-        case ADDRTYPE_IPV4:
-            $header_length = 7;
-            if(strlen($buffer) < $header_length) {
-                echo "invalid length for ipv4 address\n";
-                return false;
-            }
-            $dest_addr = ord($buffer[1]).'.'.ord($buffer[2]).'.'.ord($buffer[3]).'.'.ord($buffer[4]);
-            $port_data = unpack('n', substr($buffer, 5, 2));
-            $dest_port = $port_data[1];
-            break;
-        case ADDRTYPE_HOST:
-            if( strlen($buffer) < 2 ) {
-                echo "invalid length host name length\n";
-                return false;
-            }
-            $addrlen = ord($buffer[1]);
-            $header_length = $addrlen + 4;
-            if(strlen($buffer) < $header_length) {
-                echo "invalid host name length\n";
-                return false;
-            }
-            $dest_addr = substr($buffer, 2, $addrlen);
-            $port_data = unpack('n', substr($buffer, 2 + $addrlen, 2));
-            $dest_port = $port_data[1];
-            break;
-        case ADDRTYPE_IPV6:
-            // todo ...
-            // ipv6 not support yet ...
-            $header_length = 19;
-            if(strlen($buffer) < $header_length) {
-                echo "invalid length for ipv6 address\n";
-                return false;
-            }
-            $dest_addr = inet_ntop(substr($buffer, 1, 16));
-            $port_data = unpack('n', substr($buffer, 17, 2));
-            $dest_port = $port_data[1];
-            break;
-        default:
-            echo "unsupported addrtype $addr_type\n";
-            return false;
-    }
-    return array($addr_type, $dest_addr, $dest_port, $header_length);
-}
-
-/*
- UDP 部分 返回客户端 头部数据 by @Zac
- //生成UDP header 它这里给返回解析出来的域名貌似给udp dns域名解析用的
-*/
-function pack_header($addr,$addr_type,$port){
-    $header = '';
-    //$ip = pack('N',ip2long($addr));
-    //判断是否是合法的公共IPv4地址，192.168.1.1这类的私有IP地址将会排除在外
-    /*
-	 if(filter_var($addr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE)) {
-	 // it's valid
-	 $addr_type = ADDRTYPE_IPV4;
-	 //判断是否是合法的IPv6地址
-	 }elseif(filter_var($addr, FILTER_VALIDATE_IP, FILTER_FLAG_NO_RES_RANGE)){
-	 $addr_type = ADDRTYPE_IPV6;
-	 }
-	 */
-    switch ($addr_type) {
-        case ADDRTYPE_IPV4:
-            $header = b"\x01".inet_pton($addr);
-            break;
-        case ADDRTYPE_IPV6:
-            $header = b"\x04".inet_pton($addr);
-            break;
-        case ADDRTYPE_HOST:
-            if(strlen($addr)>255){
-                $addr = substr($addr,0,255);
-            }
-            $header =  b"\x03".chr(strlen($addr)).$addr;
-            break;
-        default:
-            return;
-    }
-    return $header.pack('n',$port);
-}
 
 // 如果不是在根目录启动，则运行runAll方法
 if(!defined('GLOBAL_START'))
