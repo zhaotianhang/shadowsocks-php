@@ -129,7 +129,7 @@ class AuthAesProtocol
             'local_client_id' => 'abcd',
         ),
     );
-    protected static $_max_time_dif = 60 * 60 * 24;
+    protected static $_max_time_dif = 86400;
     protected static $_unit_len = 8100;
     protected static $_protocolSupported = array(
         'auth_aes128_md5' => 'md5',
