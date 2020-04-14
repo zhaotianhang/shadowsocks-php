@@ -5,6 +5,9 @@ if($MODE === 'server') {
     if($UDP_ENABLE) {
         require_once 'server_udp.php';
     }
-} else {
+} elseif($MODE === 'proxy') {
+    require_once 'proxy.php';
+}
+else {
     require_once 'local.php';
 }
